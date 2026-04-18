@@ -1,3 +1,8 @@
+# Integrantes
+- Juan Camilo Suarez
+- Andres Felipe Saavedra
+- Juan Esteban Santiago
+
 # Clasificador de Imágenes con FastAPI
 
 API genérica para entrenar y usar modelos de clasificación de imágenes (Regresión Logística, SVM, Árbol de Decisión) basada en histogramas de color.
