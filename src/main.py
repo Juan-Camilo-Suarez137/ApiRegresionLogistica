@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 
 import numpy as np
 import cv2
+import joblib  # Para serialización de modelos
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from pydantic import BaseModel
 from sklearn.preprocessing import StandardScaler
@@ -31,7 +32,13 @@ class TrainingResponse(BaseModel):
     message: str
 
 # ----------------------------------------------------------------------
-# Extractores de características (igual que antes)
+# Configuración de persistencia
+# ----------------------------------------------------------------------
+MODELS_DIR = os.getenv("MODELS_DIR", "./models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# ----------------------------------------------------------------------
+# Extractores de características
 # ----------------------------------------------------------------------
 def default_histogram_extractor(image_path, channels=(1, 2), bins=(256, 256)):
     """Extrae histograma 2D de los canales especificados."""
@@ -42,7 +49,7 @@ def default_histogram_extractor(image_path, channels=(1, 2), bins=(256, 256)):
     return hist.flatten()
 
 # ----------------------------------------------------------------------
-# Clase ImageClassifier (adaptada para uso en API)
+# Clase ImageClassifier
 # ----------------------------------------------------------------------
 class ImageClassifier:
     SUPPORTED_MODELS = {
@@ -132,10 +139,50 @@ class ImageClassifier:
         proba = self.model.predict_proba(features_scaled)[0]
         return {cls: prob for cls, prob in zip(self.model.classes_, proba)}
 
+    def save(self, filepath):
+        """Serializa el clasificador a disco."""
+        data = {
+            'model_name': self.model_name,
+            'class_names': self.class_names,
+            'model_params': self.model_params,
+            'scaler': self.scaler,
+            'model': self.model,
+            '_is_trained': self._is_trained
+        }
+        joblib.dump(data, filepath)
+
+    @classmethod
+    def load(cls, filepath, feature_extractor=default_histogram_extractor):
+        """Carga un clasificador desde disco."""
+        data = joblib.load(filepath)
+        instance = cls(
+            model_name=data['model_name'],
+            class_names=data['class_names'],
+            feature_extractor=feature_extractor,
+            model_params=data['model_params']
+        )
+        instance.scaler = data['scaler']
+        instance.model = data['model']
+        instance._is_trained = data['_is_trained']
+        return instance
+
 # ----------------------------------------------------------------------
 # Almacenamiento global de modelos (en memoria)
 # ----------------------------------------------------------------------
 models_store: Dict[str, ImageClassifier] = {}
+
+# ----------------------------------------------------------------------
+# Cargar modelos existentes al arrancar
+# ----------------------------------------------------------------------
+for filename in os.listdir(MODELS_DIR):
+    if filename.endswith(".joblib"):
+        model_name = filename[:-7]  # Quita la extensión .joblib
+        filepath = os.path.join(MODELS_DIR, filename)
+        try:
+            models_store[model_name] = ImageClassifier.load(filepath)
+            print(f"Modelo '{model_name}' cargado desde {filepath}")
+        except Exception as e:
+            print(f"Error al cargar modelo {filepath}: {e}")
 
 # ----------------------------------------------------------------------
 # FastAPI app
@@ -151,31 +198,22 @@ async def train_model(
     random_state: int = Form(1),
     zip_file: UploadFile = File(..., description="Archivo ZIP con carpetas por clase")
 ):
-    """
-    Entrena un nuevo modelo a partir de un ZIP con imágenes.
-    El ZIP debe contener una carpeta por cada clase, con las imágenes dentro.
-    """
-    # Validar que el nombre del modelo no exista ya
+    """Entrena un nuevo modelo a partir de un ZIP con imágenes y lo guarda en disco."""
     if model_name in models_store:
         raise HTTPException(status_code=400, detail=f"El modelo '{model_name}' ya existe. Usa otro nombre.")
 
-    # Validar que el tipo de modelo sea soportado
     if model_type not in ImageClassifier.SUPPORTED_MODELS:
         raise HTTPException(status_code=400, detail=f"Tipo de modelo no soportado. Opciones: {list(ImageClassifier.SUPPORTED_MODELS.keys())}")
 
-    # Validar número de clases (mínimo 2)
     if len(class_names) < 2:
         raise HTTPException(status_code=400, detail="Se requieren al menos dos clases.")
 
-    # Crear directorio temporal para extraer el ZIP
     with tempfile.TemporaryDirectory() as tmp_dir:
         zip_path = os.path.join(tmp_dir, "dataset.zip")
-        # Guardar el archivo subido
         with open(zip_path, "wb") as f:
             content = await zip_file.read()
             f.write(content)
 
-        # Extraer el ZIP
         extract_dir = os.path.join(tmp_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
         try:
@@ -184,10 +222,8 @@ async def train_model(
         except zipfile.BadZipFile:
             raise HTTPException(status_code=400, detail="El archivo no es un ZIP válido.")
 
-        # Instanciar el clasificador
         classifier = ImageClassifier(model_name=model_type, class_names=class_names)
 
-        # Cargar imágenes
         try:
             X, y = classifier.load_images_from_folders(extract_dir, class_names)
         except Exception as e:
@@ -196,21 +232,22 @@ async def train_model(
         if len(X) == 0:
             raise HTTPException(status_code=400, detail="No se encontraron imágenes válidas en el dataset.")
 
-        # Entrenar modelo
         try:
             train_acc, test_acc = classifier.train(X, y, test_size=test_size, random_state=random_state)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error durante el entrenamiento: {str(e)}")
 
-        # Almacenar el modelo entrenado
+        # Guardar modelo en memoria y en disco
         models_store[model_name] = classifier
+        filepath = os.path.join(MODELS_DIR, f"{model_name}.joblib")
+        classifier.save(filepath)
 
     return TrainingResponse(
         model_name=model_name,
         status="entrenado",
         train_accuracy=train_acc,
         test_accuracy=test_acc,
-        message=f"Modelo '{model_name}' entrenado exitosamente."
+        message=f"Modelo '{model_name}' entrenado exitosamente y guardado en disco."
     )
 
 
@@ -219,10 +256,7 @@ async def predict_image(
     model_name: str,
     image: UploadFile = File(..., description="Imagen a clasificar")
 ):
-    """
-    Predice la clase de una imagen utilizando un modelo previamente entrenado.
-    """
-    # Verificar que el modelo existe
+    """Predice la clase de una imagen utilizando un modelo previamente entrenado."""
     if model_name not in models_store:
         raise HTTPException(status_code=404, detail=f"Modelo '{model_name}' no encontrado.")
 
@@ -235,7 +269,6 @@ async def predict_image(
         tmp_img_path = tmp_img.name
 
     try:
-        # Obtener predicción y probabilidades
         predicted_class = classifier.predict(tmp_img_path)
         proba_dict = classifier.predict_proba(tmp_img_path)
         confidence = proba_dict.get(predicted_class, 0.0)
@@ -243,7 +276,7 @@ async def predict_image(
         os.unlink(tmp_img_path)
         raise HTTPException(status_code=500, detail=f"Error al procesar la imagen: {str(e)}")
     finally:
-        os.unlink(tmp_img_path)  # Eliminar archivo temporal
+        os.unlink(tmp_img_path)
 
     return PredictionResponse(
         model_name=model_name,
@@ -261,9 +294,13 @@ async def list_models():
 
 @app.delete("/models/{model_name}")
 async def delete_model(model_name: str):
-    """Elimina un modelo de la memoria."""
+    """Elimina un modelo de la memoria y del disco."""
     if model_name in models_store:
         del models_store[model_name]
+        # Eliminar archivo
+        filepath = os.path.join(MODELS_DIR, f"{model_name}.joblib")
+        if os.path.exists(filepath):
+            os.remove(filepath)
         return {"status": "eliminado", "model_name": model_name}
     else:
         raise HTTPException(status_code=404, detail=f"Modelo '{model_name}' no encontrado.")

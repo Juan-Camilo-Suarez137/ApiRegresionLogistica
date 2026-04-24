@@ -1,0 +1,11 @@
+
+__pycache__
+*.pyc
+.env
+.git
+.venv
+src/dataset_flores
+src/dataset_frutas
+src/flores_rojas_azules.zip
+src/generador_pruebas.py
+src/generador_frutas.py
